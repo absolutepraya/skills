@@ -1,0 +1,86 @@
+# scele-digest configuration — copied to ~/.config/scele-digest/config.yaml by `bin/init`.
+#
+# The agent reads this file at Step 0 of the workflow (see SKILL.md) and uses
+# it as the source of truth for every per-user, per-semester value. Python
+# helpers (bin/send-digest, bin/tg-window) also read from here for delivery
+# settings.
+#
+# Fill in the placeholders below for your setup. At minimum you need:
+#   - semester
+#   - courses (at least one entry)
+#   - discord (either webhook_url OR channel_id + a bot token in env)
+
+# === Semester ===
+semester:
+  term: genap            # gasal | genap
+  year: "2025/2026"
+
+# === Course list ===
+# Each entry tells the digest one course. The abbreviations must match how
+# the scele CLI parses them from SCELE shortnames (e.g. "PPL-GNP2026" → "PPL").
+#
+# Per-course fields:
+#   abbrev          : required. Used for SCELE filtering and Todoist prefix
+#                     matching ("<abbrev> — ...").
+#   full_name       : informational, helps when you re-read this file.
+#   telegram_group  : Telegram chat title for this course's class chat, or
+#                     null if none. Passed to tg-window --chat verbatim.
+#                     If multiple courses have one, the digest fetches each.
+#   lab_team        : your team name for this course, or null. Mentions of
+#                     this team get called out by name in the AI summary.
+#   lecturers       : substrings (case-insensitive) to match against
+#                     sender_name from Telegram for high-signal flagging.
+#                     Use first names — usually unique enough.
+courses:
+  - abbrev: COURSE_A
+    full_name: "Course A Full Name"
+    telegram_group: null
+    lab_team: null
+    lecturers: []
+
+  - abbrev: COURSE_B
+    full_name: "Course B Full Name"
+    telegram_group: "Class B Telegram Group Title"
+    lab_team: "Your Team Name"
+    lecturers:
+      - "Lecturer First Name"
+
+# === Discord delivery ===
+# Choose ONE of two delivery modes. If both are set, webhook_url wins.
+#
+# Webhook mode (simpler):
+#   Create a webhook on your target channel (right-click channel → Edit →
+#   Integrations → Webhooks → New Webhook). Copy URL here. Posts appear as
+#   the webhook's configured user.
+#
+# Bot mode (richer):
+#   Register a Discord application + bot at https://discord.com/developers,
+#   invite it to your guild with the Send Messages permission on the target
+#   channel. Put the bot token in the env var named in `bot_token_env`.
+discord:
+  # Option A — webhook
+  webhook_url: null      # e.g. "https://discord.com/api/webhooks/<id>/<token>"
+
+  # Option B — bot
+  channel_id: null       # numeric channel ID as a string. Enable Developer
+                         # Mode in Discord, then right-click channel → Copy ID.
+  bot_token_env: "DISCORD_BOT_TOKEN"   # name of env var to read the bot token from
+
+# === Telegram integration ===
+# Set enabled: false to skip Step 5 entirely (digest will only cover SCELE
+# deadlines + announcements + Todoist).
+#
+# When enabled, you need a Telegram user session — see README.md for how
+# to generate one. Put the credentials in ~/.config/scele-digest/telegram.env
+# (or whatever path you point env_file to).
+telegram:
+  enabled: false
+  env_file: "~/.config/scele-digest/telegram.env"
+
+# === Todoist integration ===
+# Set enabled: false to skip auto-adding new deadlines as Todoist tasks.
+# When enabled, the agent calls Todoist MCP `add_task` with this project_id.
+todoist:
+  enabled: false
+  project_id: null       # Todoist project ID — find by opening the project
+                         # in Todoist web and copying the id from the URL.

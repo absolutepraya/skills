@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# scele-digest first-time setup.
+#
+# Creates ~/.config/scele-digest/ and seeds it with example config + env
+# files. Idempotent — won't overwrite existing files.
+
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_DIR="${HOME}/.config/scele-digest"
+mkdir -p "${CONFIG_DIR}"
+
+seed() {
+    local src="${SKILL_DIR}/templates/$1"
+    local dst="${CONFIG_DIR}/$2"
+    if [[ -e "${dst}" ]]; then
+        echo "  exists: ${dst}"
+    elif [[ ! -e "${src}" ]]; then
+        echo "  MISSING TEMPLATE: ${src}"
+        return 1
+    else
+        cp "${src}" "${dst}"
+        echo "  seeded: ${dst}"
+    fi
+}
+
+echo "scele-digest init"
+echo "  skill dir:  ${SKILL_DIR}"
+echo "  config dir: ${CONFIG_DIR}"
+echo ""
+
+seed "config.yaml.example"   "config.yaml"
+seed "telegram.env.example"  "telegram.env"
+
+chmod 600 "${CONFIG_DIR}/telegram.env" 2>/dev/null || true
+
+echo ""
+echo "next steps:"
+echo "  1. edit ${CONFIG_DIR}/config.yaml — fill in semester, courses, discord."
+echo "  2. (optional) edit ${CONFIG_DIR}/telegram.env if you want telegram integration."
+echo "  3. install python deps:"
+echo "       python3 -m venv ${SKILL_DIR}/.venv"
+echo "       ${SKILL_DIR}/.venv/bin/pip install pyyaml requests telethon python-dotenv"
+echo "  4. point bin/send-digest + bin/tg-window to that venv (edit the shebang or symlink)."
+echo "  5. test: see README.md for run/dry-run examples."

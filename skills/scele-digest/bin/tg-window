@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""tg-window — fetch Telegram messages from a chat in a fixed time window.
+
+Output is deterministic structured JSON so the agent doesn't have to slice a
+45K-char get_history dump itself. Filters out only the things that can be
+judged mechanically — bot senders, action/system messages, empty messages.
+Chitchat/off-topic judgment is left to the agent working from this clean
+slice.
+
+Usage:
+  tg-window --chat "Class Chat Title" --hours 24 [--limit N] [--include-dropped] [--env-file PATH]
+
+Auth: by default reads TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_SESSION_STRING
+from ~/.config/scele-digest/telegram.env. Override with --env-file or by
+exporting those names into the process environment before calling.
+
+Output (stdout, JSON array, newest first):
+  [
+    {
+      "sender_name": "...",
+      "sender_id": 12345,
+      "sender_is_bot": false,
+      "sender_username": "..." | null,
+      "timestamp_iso": "...",
+      "text": "...",
+      "has_media": false,
+      "media_hint": "photo" | "document" | "voice" | "video" | "sticker" | null,
+      "url": "https://t.me/c/<chat>/<msg>"  # empty for basic groups
+    }
+  ]
+"""
+import argparse
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import Channel, Chat, User
+
+
+DEFAULT_ENV_FILE = Path.home() / ".config" / "scele-digest" / "telegram.env"
+
+
+def media_hint(msg):
+    if not msg.media:
+        return None
+    if msg.photo:
+        return "photo"
+    if msg.video:
+        return "video"
+    if msg.voice:
+        return "voice"
+    if msg.sticker:
+        return "sticker"
+    if msg.document:
+        return "document"
+    return msg.media.__class__.__name__.replace("MessageMedia", "").lower() or "other"
+
+
+def is_system_action(msg):
+    return msg.action is not None
+
+
+def sender_info(sender):
+    if sender is None:
+        return ("(unknown)", None, None, False)
+    if isinstance(sender, User):
+        name_parts = [p for p in (sender.first_name, sender.last_name) if p]
+        name = " ".join(name_parts) if name_parts else (sender.username or f"user_{sender.id}")
+        return (name, sender.id, sender.username, bool(sender.bot))
+    if isinstance(sender, (Chat, Channel)):
+        return (sender.title or f"chat_{sender.id}", sender.id, getattr(sender, "username", None), False)
+    return (str(sender), getattr(sender, "id", None), None, False)
+
+
+def message_url(chat, msg_id):
+    """Build a t.me deep link to one message. Basic groups have no public link."""
+    if isinstance(chat, Channel):
+        return f"https://t.me/c/{chat.id}/{msg_id}"
+    return ""
+
+
+async def resolve_chat(client, chat_query):
+    """Resolve a chat by numeric ID, @username, or exact title (dialog scan).
+
+    Basic groups have no @username, so get_entity by title-string fails on
+    cold dialogs. Try numeric → entity → dialog title scan in that order.
+    """
+    # Numeric ID
+    try:
+        return await client.get_entity(int(chat_query))
+    except (ValueError, TypeError):
+        pass
+    # Username / public chat
+    try:
+        return await client.get_entity(chat_query)
+    except (ValueError, TypeError):
+        pass
+    # Title scan
+    target = chat_query.strip().lower()
+    async for d in client.iter_dialogs():
+        title = (getattr(d.entity, "title", None) or "").strip().lower()
+        if title == target:
+            return d.entity
+    return None
+
+
+async def run(chat_query, hours, limit, include_dropped, env_file):
+    env_path = Path(env_file).expanduser()
+    if env_path.exists():
+        load_dotenv(env_path)
+    # Process env vars take precedence over file (load_dotenv doesn't override existing).
+    api_id = os.environ.get("TELEGRAM_API_ID")
+    api_hash = os.environ.get("TELEGRAM_API_HASH")
+    session_str = os.environ.get("TELEGRAM_SESSION_STRING")
+    if not (api_id and api_hash and session_str):
+        raise RuntimeError(
+            f"missing TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_SESSION_STRING "
+            f"(checked env-file {env_path} and process env)"
+        )
+
+    client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telegram session not authorized — regenerate TELEGRAM_SESSION_STRING.")
+
+    chat = await resolve_chat(client, chat_query)
+    if chat is None:
+        raise RuntimeError(f"could not resolve chat: {chat_query!r}")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    out = []
+    async for msg in client.iter_messages(chat, limit=limit):
+        if msg.date < cutoff:
+            break
+
+        drop = None
+        if is_system_action(msg):
+            drop = "system_action"
+        sender = await msg.get_sender() if msg.sender_id else None
+        name, sid, uname, is_bot = sender_info(sender)
+        if drop is None and is_bot:
+            drop = "bot_sender"
+        if drop is None and not (msg.text or msg.media):
+            drop = "empty"
+
+        if drop and not include_dropped:
+            continue
+
+        entry = {
+            "sender_name": name,
+            "sender_id": sid,
+            "sender_username": uname,
+            "sender_is_bot": is_bot,
+            "timestamp_iso": msg.date.astimezone().isoformat(),
+            "text": msg.text or "",
+            "has_media": msg.media is not None,
+            "media_hint": media_hint(msg),
+            "url": message_url(chat, msg.id),
+            "msg_id": msg.id,
+        }
+        if include_dropped:
+            entry["drop_reason"] = drop
+        out.append(entry)
+
+    await client.disconnect()
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fetch Telegram messages in a time window with deterministic filters.")
+    ap.add_argument("--chat", required=True, help="Chat title, @username, or numeric ID.")
+    ap.add_argument("--hours", type=int, default=24, help="Window in hours (default 24).")
+    ap.add_argument("--limit", type=int, default=500, help="Max messages to scan (default 500).")
+    ap.add_argument("--include-dropped", action="store_true",
+                    help="Include filtered-out messages in output with drop_reason field. For debugging.")
+    ap.add_argument("--env-file", default=str(DEFAULT_ENV_FILE),
+                    help=f"Path to env file with TELEGRAM_API_ID / API_HASH / SESSION_STRING. Default: {DEFAULT_ENV_FILE}")
+    args = ap.parse_args()
+
+    try:
+        result = asyncio.run(run(args.chat, args.hours, args.limit, args.include_dropped, args.env_file))
+    except Exception as e:
+        print(json.dumps({"error": str(e), "type": e.__class__.__name__}), file=sys.stderr)
+        sys.exit(2)
+
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -13,6 +13,7 @@ npx skills add absolutepraya/skills/<skill-name>
 | Skill | What it does | Install |
 |---|---|---|
 | [`scele`](./skills/scele) | CLI for Fasilkom UI's SCELE Moodle LMS — fetch deadlines, browse course materials, submit assignments, read forum threads, bind PDFs, etc. Bash 4+, requires SCELE creds. | `npx skills add absolutepraya/skills/scele` |
+| [`scele-digest`](./skills/scele-digest) | Companion to `scele`. Daily digest posted to Discord — SCELE deadlines + announcements + class-chat Telegram summary + Todoist sync. Python, supports webhook or bot delivery. | `npx skills add absolutepraya/skills/scele-digest` |
 
 ## Why a monorepo
 
