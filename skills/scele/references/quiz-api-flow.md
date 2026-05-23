@@ -9,7 +9,7 @@ a separate module type and need `mod_quiz_get_quizzes_by_courses` to discover.
 ## Key discovery
 
 Quiz **"quiz gpu memory performance - coalescing"** (quiz ID 9933, coursemodule 213588):
-- Was announced by pak Heru in Telegram group "progpar 26 UI" the day before
+- Announced by the lecturer outside SCELE (off-platform class chat) the day before
 - Was NOT visible in `scele events` or `scele deadlines`
 - Had to be discovered via `mod_quiz_get_quizzes_by_courses` API call
 - timeopen: 1777857300 = 2026-05-04 08:15 WIB (that particular week — future quizzes get new IDs)
