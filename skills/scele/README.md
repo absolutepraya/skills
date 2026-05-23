@@ -15,9 +15,11 @@ The CLI drops it into `~/.claude/skills/scele/` (or wherever your agent looks).
 Bash 4+, `curl`, and `jq` are required. On macOS: `brew install bash jq`.
 
 ```bash
-# 1. SCELE creds in ~/.secrets (sourced by ~/.zshrc or similar)
-echo 'export SCELE_USERNAME="2306xxxxxx"' >> ~/.secrets
-echo 'export SCELE_PASSWORD="..."'        >> ~/.secrets
+# 1. SCELE creds in ~/.secrets (sourced by ~/.zshrc or similar).
+#    Your SCELE_USERNAME is the UI SSO username, which is the local-part of
+#    your @ui.ac.id email (e.g., "firstname.lastname"), NOT your NPM.
+echo 'export SCELE_USERNAME="firstname.lastname"' >> ~/.secrets
+echo 'export SCELE_PASSWORD="..."'                >> ~/.secrets
 
 # 2. Create per-user profile from template
 ~/.claude/skills/scele/bin/scele init

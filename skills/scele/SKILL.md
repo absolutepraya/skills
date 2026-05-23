@@ -28,9 +28,11 @@ Trigger phrases (Indonesian & English):
 This skill is per-user — it needs to know your NPM, kelas, and which courses you're taking this semester.
 
 ```bash
-# 1. Put SCELE creds somewhere your shell sources at startup (e.g., ~/.secrets)
-echo 'export SCELE_USERNAME="2306xxxxxx"' >> ~/.secrets
-echo 'export SCELE_PASSWORD="..."'        >> ~/.secrets
+# 1. Put SCELE creds somewhere your shell sources at startup (e.g., ~/.secrets).
+#    SCELE_USERNAME is the UI SSO username, which is the local-part of your
+#    @ui.ac.id email (e.g., "firstname.lastname") — NOT your NPM.
+echo 'export SCELE_USERNAME="firstname.lastname"' >> ~/.secrets
+echo 'export SCELE_PASSWORD="..."'                >> ~/.secrets
 
 # 2. Create your profile from the bundled template
 ~/.claude/skills/scele/bin/scele init
