@@ -1,0 +1,44 @@
+# scele profile — copied to ~/.config/scele/profile.sh by `scele init`.
+# Edit this file with your own identity + course enrolments.
+# All values are optional but a missing one disables the related command.
+
+# === General identity ===
+USER_NPM=""                                  # your NPM, e.g. "2306123456"
+USER_NAME="Your Full Name"
+USER_NAME_FILENAME="YourNameNoSpaces"        # used in filename templates like Final_BatchN_NPM_Nama
+USER_EMAIL_UI="you@ui.ac.id"
+USER_EMAIL_GMAIL="you@gmail.com"
+USER_CLASS="A"                               # general kelas (used to filter deadlines)
+
+# === KP-specific ===
+USER_KP_CLASS="A"
+USER_KP_BATCH="1"                            # for Final_BatchN_NPM_Nama.pdf naming
+USER_KP_DOSEN_CODE="JNA"                     # e.g. JNA, IS, MO
+USER_KP_DOSEN_NAME="Dosen Full Name, S.Kom., M.Kom."
+USER_KP_DOSEN_EMAIL="dosen@cs.ui.ac.id"
+USER_KP_INSTANSI="PT Your Company"
+USER_KP_PENYELIA="Penyelia Full Name"
+
+# === Enrolled courses (this semester) ===
+# Set these so `scele content`, `scele deadlines`, `scele submissions <abbr>` work
+# with friendly names instead of numeric course IDs.
+# Find the numeric ID by visiting the course in SCELE: the URL contains ?id=<num>.
+COURSE_IDS=(
+  [KP]=4126
+  [PPL]=4125
+  [ProgPar]=4157
+  [MPPI]=4139
+)
+
+# Partial-match strings for reverse lookup (full SCELE course name → abbreviation).
+# Keys must match COURSE_IDS above.
+COURSE_NAMES=(
+  [KP]="Kerja Praktik"
+  [PPL]="Proyek Perangkat Lunak"
+  [ProgPar]="Pemrograman Parallel"
+  [MPPI]="Metodologi Penelitian"
+)
+
+# === Optional: extend known Google Sheets ===
+# KNOWN_SHEETS already includes [pembagian_dosen_kp]. Add more like:
+# KNOWN_SHEETS[my_other_sheet]="<sheet_id>"

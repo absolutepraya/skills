@@ -1,0 +1,1177 @@
+#!/usr/bin/env bash
+# scele - SCELE (Fasilkom UI Moodle LMS) CLI tool
+# Usage: scele <command> [args]
+# Requires: bash 4+, curl, jq, SCELE_USERNAME and SCELE_PASSWORD env vars (from ~/.secrets)
+
+# Re-exec under bash 4+ if invoked under older bash (associative arrays require >=4).
+# macOS ships bash 3.2 at /bin/bash; Homebrew's bash 5 is at /opt/homebrew/bin/bash.
+if (( BASH_VERSINFO[0] < 4 )); then
+  for bin in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash; do
+    [[ -x "$bin" ]] && exec "$bin" "$0" "$@"
+  done
+  echo "Error: requires bash 4+ (install via 'brew install bash')" >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+# Load secrets if not already in environment
+if [[ -z "${SCELE_USERNAME:-}" ]]; then
+  [[ -f "$HOME/.secrets" ]] && source "$HOME/.secrets"
+fi
+
+SCELE_USERNAME="${SCELE_USERNAME:?Error: SCELE_USERNAME not set. Source ~/.secrets or export it.}"
+SCELE_PASSWORD="${SCELE_PASSWORD:?Error: SCELE_PASSWORD not set. Source ~/.secrets or export it.}"
+
+SCELE_URL="https://scele.cs.ui.ac.id"
+TOKEN_CACHE="/tmp/scele_token"
+
+# === User profile (defaults; override via ~/.config/scele/profile.sh) ===
+# Anyone using this skill creates their own profile file. Run `scele init` once
+# to copy a starter template into ~/.config/scele/profile.sh, then edit it with
+# your own NPM, kelas, dosen, etc.
+USER_CLASS="${USER_CLASS:-}"                   # general kelas, e.g. "D" — used to filter deadlines
+USER_NPM="${USER_NPM:-}"
+USER_NAME="${USER_NAME:-}"
+USER_NAME_FILENAME="${USER_NAME_FILENAME:-}"   # for SCELE filename templates like Final_BatchN_NPM_Nama
+USER_EMAIL_UI="${USER_EMAIL_UI:-}"
+USER_EMAIL_GMAIL="${USER_EMAIL_GMAIL:-}"
+# KP-specific
+USER_KP_CLASS="${USER_KP_CLASS:-}"
+USER_KP_BATCH="${USER_KP_BATCH:-1}"            # Final_BatchN filename. KP Reguler typically has 1 batch per semester.
+USER_KP_DOSEN_CODE="${USER_KP_DOSEN_CODE:-}"
+USER_KP_DOSEN_NAME="${USER_KP_DOSEN_NAME:-}"
+USER_KP_DOSEN_EMAIL="${USER_KP_DOSEN_EMAIL:-}"
+USER_KP_INSTANSI="${USER_KP_INSTANSI:-}"
+USER_KP_PENYELIA="${USER_KP_PENYELIA:-}"
+
+# Default course mappings (empty by design; populate in profile.sh).
+# Why bash 4+ associative arrays must be declared before sourcing: the profile
+# can't `declare -A` again or it overwrites; instead it sets keys directly.
+declare -A COURSE_IDS=()
+declare -A COURSE_NAMES=()
+declare -A KNOWN_SHEETS=(
+  [pembagian_dosen_kp]="1pkihXHLKUcPiB59KTYTdkJPRYEiKR8vv0_uASMRty9M"
+)
+
+# Load user profile if it exists (overrides defaults above and may set COURSE_IDS etc.)
+if [[ -f "$HOME/.config/scele/profile.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.config/scele/profile.sh"
+fi
+
+# Reverse lookup: find abbreviation from course name
+abbrev_from_name() {
+  local name="$1"
+  for abbr in "${!COURSE_NAMES[@]}"; do
+    if echo "$name" | grep -qi "${COURSE_NAMES[$abbr]}"; then
+      echo "$abbr"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+# Resolve abbreviation or course ID from user input
+resolve_course_id() {
+  local input="$1"
+  # Check if it's an abbreviation
+  if [[ -n "${COURSE_IDS[$input]:-}" ]]; then
+    echo "${COURSE_IDS[$input]}"
+    return 0
+  fi
+  # Check if it's already a numeric ID
+  if [[ "$input" =~ ^[0-9]+$ ]]; then
+    echo "$input"
+    return 0
+  fi
+  # Try case-insensitive abbreviation match
+  for abbr in "${!COURSE_IDS[@]}"; do
+    if [[ "${abbr,,}" == "${input,,}" ]]; then
+      echo "${COURSE_IDS[$abbr]}"
+      return 0
+    fi
+  done
+  echo "Error: Unknown course '$input'. Known: ${!COURSE_IDS[*]}" >&2
+  return 1
+}
+
+usage() {
+  cat <<EOF
+scele - SCELE (Fasilkom UI Moodle LMS) CLI
+
+Usage:
+  scele events              List all upcoming events (default)
+  scele deadlines           List upcoming assignment deadlines only
+  scele courses             List enrolled courses
+  scele content <course> [section]  Browse course materials (sections & files)
+  scele download <course> <filename>  Download a file from course materials
+  scele submit <cmid> <file>  Upload and submit assignment
+  scele status <cmid>       Check submission status for an assignment
+  scele assignid <cmid>     Get assignment ID from course module ID
+  scele grades <course>    Show grades for a course
+  scele submissions <course>  List all assignments with submission status
+  scele announcements <course>  Show recent course announcements/forum posts
+  scele assignment <cmid>   Show full assignment intro, naming rules, file limits, deadlines
+  scele posts <discid>      List every post in a forum discussion thread
+  scele page <cmid>         Read body text of a page/label/any module
+  scele bind <out> <in...>  Concat PDFs (laporan + lampiran into single file)
+  scele sheet <alias> [npm] Fetch Google Sheet as CSV (and optionally find row)
+  scele me                  Print user profile constants (NPM, KP class, etc.)
+  scele init                Create ~/.config/scele/profile.sh from template (first-time setup)
+  scele help                Show this help
+
+Course abbreviations: KP, PPL, ProgPar, MPPI
+
+Examples:
+  scele                          # same as 'scele events'
+  scele deadlines                # deadlines filtered to Kelas ${USER_CLASS}
+  scele content MPPI             # list all MPPI course materials
+  scele content MPPI "Minggu 3"  # filter to section matching "Minggu 3"
+  scele download MPPI "Assignment_2_Critique_Paper.pptx"
+  scele submit 206892 ~/output.pdf
+  scele status 206892
+  scele assignid 206892          # returns assignment ID (e.g., 24056)
+  scele grades MPPI              # show grades for MPPI
+  scele submissions MPPI         # list all MPPI assignments + status
+  scele announcements KP         # show recent KP announcements
+  scele assignment 204780        # show Laporan Akhir KP full description + naming rules
+  scele posts 62147              # list every post in a thread (verify forum-log batch)
+  scele page 204768              # read a page/label module body (e.g., Linimasa)
+  scele bind out.pdf body.pdf lampiran1.pdf lampiran2.pdf
+  scele sheet pembagian_dosen_kp "\$USER_NPM"   # find own row
+  scele me                       # print profile constants
+EOF
+}
+
+# Get or cache authentication token
+get_token() {
+  # Check cache first
+  if [[ -f "$TOKEN_CACHE" ]]; then
+    local cached_token
+    cached_token=$(cat "$TOKEN_CACHE")
+    if [[ -n "$cached_token" ]]; then
+      echo "$cached_token"
+      return 0
+    fi
+  fi
+
+  # Fetch new token
+  local response
+  response=$(curl -sf -X POST "${SCELE_URL}/login/token.php" \
+    -d "username=${SCELE_USERNAME}" \
+    -d "password=${SCELE_PASSWORD}" \
+    -d "service=moodle_mobile_app" 2>&1) || {
+    echo "Error: Failed to connect to SCELE" >&2
+    return 1
+  }
+
+  # Check for error in response
+  if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+    local error_msg
+    error_msg=$(echo "$response" | jq -r '.error')
+    echo "Error: Authentication failed - $error_msg" >&2
+    return 1
+  fi
+
+  local token
+  token=$(echo "$response" | jq -r '.token')
+  if [[ -z "$token" || "$token" == "null" ]]; then
+    echo "Error: No token received from SCELE" >&2
+    return 1
+  fi
+
+  # Cache the token
+  echo "$token" > "$TOKEN_CACHE"
+  echo "$token"
+}
+
+# Make an API call to SCELE
+api_call() {
+  local wsfunction="$1"
+  shift
+  local token
+  token=$(get_token) || return 1
+
+  local url="${SCELE_URL}/webservice/rest/server.php?wstoken=${token}&wsfunction=${wsfunction}&moodlewsrestformat=json"
+
+  # Append extra params
+  for param in "$@"; do
+    url="${url}&${param}"
+  done
+
+  local response
+  response=$(curl -sf "$url" 2>&1) || {
+    echo "Error: API call to ${wsfunction} failed" >&2
+    return 1
+  }
+
+  # Check for token expiry / invalid token
+  if echo "$response" | jq -e '.errorcode' >/dev/null 2>&1; then
+    local errorcode
+    errorcode=$(echo "$response" | jq -r '.errorcode')
+    if [[ "$errorcode" == "invalidtoken" ]]; then
+      # Clear cache and retry once
+      rm -f "$TOKEN_CACHE"
+      token=$(get_token) || return 1
+      url="${SCELE_URL}/webservice/rest/server.php?wstoken=${token}&wsfunction=${wsfunction}&moodlewsrestformat=json"
+      for param in "$@"; do
+        url="${url}&${param}"
+      done
+      response=$(curl -sf "$url" 2>&1) || {
+        echo "Error: API call to ${wsfunction} failed after re-auth" >&2
+        return 1
+      }
+    else
+      local message
+      message=$(echo "$response" | jq -r '.message // .error // "Unknown error"')
+      echo "Error: API error ($errorcode) - $message" >&2
+      return 1
+    fi
+  fi
+
+  echo "$response"
+}
+
+# Get user ID (needed for some API calls)
+get_userid() {
+  local info
+  info=$(api_call "core_webservice_get_site_info") || return 1
+  echo "$info" | jq -r '.userid'
+}
+
+# Format a unix timestamp to human-readable date
+format_date() {
+  date -d "@$1" "+%b %-d" 2>/dev/null || date -r "$1" "+%b %-d" 2>/dev/null
+}
+
+format_time() {
+  date -d "@$1" "+%H:%M" 2>/dev/null || date -r "$1" "+%H:%M" 2>/dev/null
+}
+
+format_datetime() {
+  date -d "@$1" "+%a, %b %-d %H:%M" 2>/dev/null || date -r "$1" "+%a, %b %-d %H:%M" 2>/dev/null
+}
+
+# Decode HTML entities in text
+html_decode() {
+  sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g'
+}
+
+# List upcoming events, filtered to user's class
+cmd_events() {
+  local filter="${1:-all}"  # "all" or "assign"
+  local data
+  data=$(api_call "core_calendar_get_calendar_upcoming_view") || return 1
+
+  local event_count
+  event_count=$(echo "$data" | jq '.events | length')
+
+  if [[ "$event_count" -eq 0 ]]; then
+    echo "No upcoming events found."
+    return 0
+  fi
+
+  local jq_filter='.events'
+  if [[ "$filter" == "assign" ]]; then
+    jq_filter='.events | [.[] | select(.modulename == "assign")]'
+  fi
+
+  local label="Upcoming Events"
+  [[ "$filter" == "assign" ]] && label="Upcoming Deadlines"
+
+  echo "SCELE ${label} (Kelas ${USER_CLASS})"
+  echo "$(printf '=%.0s' $(seq 1 $((${#label} + 10 + ${#USER_CLASS}))))"
+  echo ""
+
+  # Filter: show only items for user's class, or items without class designation
+  echo "$data" | jq -r "${jq_filter} | .[] | [
+    (.timestart | tostring),
+    .name,
+    (.course.fullname // \"Unknown Course\"),
+    (.url // \"-\"),
+    (.modulename // \"unknown\"),
+    (.action.name // \"-\")
+  ] | @tsv" | while IFS=$'\t' read -r timestart name course url modulename action; do
+    # Filter by class: show if matches user's class OR has no class designation
+    if echo "$name" | grep -q "Kelas " && ! echo "$name" | grep -q "Kelas ${USER_CLASS}"; then
+      continue
+    fi
+    local dt
+    dt=$(format_datetime "$timestart")
+    # Clean up course name - remove [Reg] prefix for brevity
+    local short_course
+    short_course=$(echo "$course" | sed 's/^\[Reg\] //' | html_decode)
+    name=$(echo "$name" | html_decode)
+
+    echo "  ${dt}   ${short_course}"
+    echo "               ${name}"
+    [[ "$url" != "-" ]] && echo "               -> ${url}"
+    echo ""
+  done
+}
+
+# List enrolled courses
+cmd_courses() {
+  local userid
+  userid=$(get_userid) || return 1
+
+  local data
+  data=$(api_call "core_enrol_get_users_courses" "userid=${userid}") || return 1
+
+  local course_count
+  course_count=$(echo "$data" | jq 'length')
+
+  if [[ "$course_count" -eq 0 ]]; then
+    echo "No enrolled courses found."
+    return 0
+  fi
+
+  echo "SCELE Enrolled Courses"
+  echo "======================"
+  echo ""
+
+  echo "$data" | jq -r '.[] | select(.visible == 1) | [
+    .shortname,
+    .fullname,
+    (.progress // 0 | round | tostring),
+    (.id | tostring),
+    ("https://scele.cs.ui.ac.id/course/view.php?id=" + (.id | tostring))
+  ] | @tsv' | while IFS=$'\t' read -r shortname fullname progress courseid url; do
+    fullname=$(echo "$fullname" | html_decode)
+    echo "  [${shortname}] (ID: ${courseid})"
+    echo "  ${fullname}"
+    echo "  Progress: ${progress}%  |  ${url}"
+    echo ""
+  done
+}
+
+# Browse course materials (sections & files)
+cmd_content() {
+  local course_input="${1:?Error: course abbreviation or ID required (e.g., MPPI, ProgPar)}"
+  local section_filter="${2:-}"
+
+  local course_id
+  course_id=$(resolve_course_id "$course_input") || return 1
+
+  local data
+  data=$(api_call "core_course_get_contents" "courseid=${course_id}") || return 1
+
+  echo "SCELE Course Content: ${course_input} (ID: ${course_id})"
+  echo "$(printf '=%.0s' $(seq 1 50))"
+  echo ""
+
+  echo "$data" | jq -r '.[] | @json' | while read -r section_json; do
+    local section_name
+    section_name=$(echo "$section_json" | jq -r '.name' | html_decode)
+
+    # Filter by section name if provided
+    if [[ -n "$section_filter" ]] && ! echo "$section_name" | grep -qi "$section_filter"; then
+      continue
+    fi
+
+    local module_count
+    module_count=$(echo "$section_json" | jq '.modules | length')
+    if [[ "$module_count" -eq 0 ]] && [[ -n "$section_filter" ]]; then
+      continue
+    fi
+
+    echo "## ${section_name}"
+    echo ""
+
+    echo "$section_json" | jq -r '.modules[] | @json' | while read -r mod_json; do
+      local mod_name mod_modname mod_url
+      mod_name=$(echo "$mod_json" | jq -r '.name' | html_decode)
+      mod_modname=$(echo "$mod_json" | jq -r '.modname')
+      mod_url=$(echo "$mod_json" | jq -r '.url // "-"')
+
+      # Show module type icon
+      local icon="  "
+      case "$mod_modname" in
+        resource) icon="📄" ;;
+        assign)   icon="📝" ;;
+        url)      icon="🔗" ;;
+        label)    icon="📌" ;;
+        quiz)     icon="❓" ;;
+        forum)    icon="💬" ;;
+        *)        icon="  " ;;
+      esac
+
+      echo "  ${icon} [${mod_modname}] ${mod_name}"
+
+      # Show files if any
+      echo "$mod_json" | jq -r '.contents[]? | @json' 2>/dev/null | while read -r file_json; do
+        local filename filesize filetype fileurl
+        filename=$(echo "$file_json" | jq -r '.filename')
+        filesize=$(echo "$file_json" | jq -r '.filesize')
+        filetype=$(echo "$file_json" | jq -r '.type')
+
+        if [[ "$filetype" == "file" ]]; then
+          local size_human
+          if [[ "$filesize" -gt 1048576 ]]; then
+            size_human="$(( filesize / 1048576 ))MB"
+          elif [[ "$filesize" -gt 1024 ]]; then
+            size_human="$(( filesize / 1024 ))KB"
+          else
+            size_human="${filesize}B"
+          fi
+          echo "       ↳ ${filename} (${size_human})"
+        elif [[ "$filetype" == "url" ]]; then
+          local fileurl
+          fileurl=$(echo "$file_json" | jq -r '.fileurl')
+          echo "       ↳ ${filename} → ${fileurl}"
+        fi
+      done
+    done
+    echo ""
+  done
+}
+
+# Download a file from course materials
+cmd_download() {
+  local course_input="${1:?Error: course abbreviation or ID required}"
+  local filename="${2:?Error: filename to download required}"
+
+  local course_id
+  course_id=$(resolve_course_id "$course_input") || return 1
+
+  local token
+  token=$(get_token) || return 1
+
+  local data
+  data=$(api_call "core_course_get_contents" "courseid=${course_id}") || return 1
+
+  # Search for the file across all sections
+  local fileurl
+  fileurl=$(echo "$data" | jq -r --arg fn "$filename" '
+    [.. | objects | select(.filename? == $fn and .type? == "file") | .fileurl] | first // empty
+  ')
+
+  if [[ -z "$fileurl" ]]; then
+    # Try partial match
+    fileurl=$(echo "$data" | jq -r --arg fn "$filename" '
+      [.. | objects | select(.filename? and .type? == "file" and (.filename | test($fn; "i"))) | .fileurl] | first // empty
+    ')
+  fi
+
+  if [[ -z "$fileurl" ]]; then
+    echo "Error: File '$filename' not found in course ${course_input}" >&2
+    return 1
+  fi
+
+  # Append token to URL
+  local download_url="${fileurl}&token=${token}"
+  # Remove ?forcedownload=1 and replace with token
+  download_url=$(echo "$download_url" | sed 's/\?forcedownload=1/\?token='"${token}"'/')
+
+  local outdir="/tmp/scele-fetch"
+  mkdir -p "$outdir"
+  local outpath="${outdir}/${filename}"
+
+  curl -sfL "${fileurl%%\?*}?token=${token}" -o "$outpath" || {
+    echo "Error: Failed to download '$filename'" >&2
+    return 1
+  }
+
+  local size
+  size=$(du -h "$outpath" | cut -f1)
+  echo "Downloaded to ${outpath} (${size})"
+}
+
+# Submit an assignment: upload file then save submission
+cmd_submit() {
+  local cmid="${1:?Error: course module ID required (from SCELE URL)}"
+  local filepath="${2:?Error: file path required}"
+
+  if [[ ! -f "$filepath" ]]; then
+    echo "Error: File not found: $filepath" >&2
+    return 1
+  fi
+
+  local token
+  token=$(get_token) || return 1
+
+  # Step 1: Upload file to draft area
+  echo "Uploading $(basename "$filepath")..."
+  local upload_response
+  upload_response=$(curl -sf -X POST "${SCELE_URL}/webservice/upload.php" \
+    -F "token=${token}" \
+    -F "filearea=draft" \
+    -F "itemid=0" \
+    -F "file=@${filepath}") || {
+    echo "Error: Upload failed" >&2
+    return 1
+  }
+
+  local itemid
+  itemid=$(echo "$upload_response" | jq -r '.[0].itemid // empty')
+  if [[ -z "$itemid" ]]; then
+    echo "Error: Upload succeeded but no itemid returned" >&2
+    echo "$upload_response" >&2
+    return 1
+  fi
+
+  # Step 2: Resolve assignment ID from cmid
+  local assign_id
+  assign_id=$(cmd_assignid "$cmid" 2>/dev/null) || {
+    echo "Error: Could not resolve assignment ID for cmid=$cmid" >&2
+    return 1
+  }
+
+  # Step 3: Save submission
+  echo "Submitting to assignment ${assign_id} (cmid=${cmid})..."
+  local submit_response
+  submit_response=$(curl -sf -X POST "${SCELE_URL}/webservice/rest/server.php" \
+    -d "wstoken=${token}" \
+    -d "wsfunction=mod_assign_save_submission" \
+    -d "moodlewsrestformat=json" \
+    -d "assignmentid=${assign_id}" \
+    -d "plugindata[files_filemanager]=${itemid}") || {
+    echo "Error: Submission failed" >&2
+    return 1
+  }
+
+  # Check for errors
+  if echo "$submit_response" | jq -e '.errorcode' >/dev/null 2>&1; then
+    local errmsg
+    errmsg=$(echo "$submit_response" | jq -r '.message // "Unknown error"')
+    echo "Error: Submission failed - $errmsg" >&2
+    return 1
+  fi
+
+  echo "Submitted successfully!"
+
+  # Verify
+  cmd_status "$cmid"
+}
+
+# Check submission status
+cmd_status() {
+  local cmid="${1:?Error: course module ID required}"
+
+  local assign_id
+  assign_id=$(cmd_assignid "$cmid" 2>/dev/null) || {
+    echo "Error: Could not resolve assignment ID for cmid=$cmid" >&2
+    return 1
+  }
+
+  local userid
+  userid=$(get_userid) || return 1
+
+  local data
+  data=$(api_call "mod_assign_get_submission_status" "assignid=${assign_id}" "userid=${userid}") || return 1
+
+  local status timemodified
+  status=$(echo "$data" | jq -r '.lastattempt.submission.status // "no submission"')
+  timemodified=$(echo "$data" | jq -r '.lastattempt.submission.timemodified // 0')
+
+  echo "Assignment Status (cmid=${cmid}, assignid=${assign_id})"
+  echo "  Status: ${status}"
+
+  if [[ "$timemodified" != "0" ]]; then
+    local dt
+    dt=$(format_datetime "$timemodified")
+    echo "  Last modified: ${dt}"
+  fi
+
+  # List submitted files
+  local files
+  files=$(echo "$data" | jq -r '.lastattempt.submission.plugins[]? | select(.type=="file") | .fileareas[0].files[]? | .filename' 2>/dev/null)
+  if [[ -n "$files" ]]; then
+    echo "  Files:"
+    echo "$files" | while read -r f; do
+      echo "    - ${f}"
+    done
+  fi
+}
+
+# Resolve assignment ID from course module ID (cmid)
+cmd_assignid() {
+  local cmid="${1:?Error: course module ID required}"
+
+  # We need to find which course this cmid belongs to, then search assignments
+  # Try all known courses
+  for course_id in "${COURSE_IDS[@]}"; do
+    local data
+    data=$(api_call "mod_assign_get_assignments" "courseids%5B0%5D=${course_id}" 2>/dev/null) || continue
+
+    local result
+    result=$(echo "$data" | jq -r --arg cmid "$cmid" '
+      .courses[0].assignments[] | select(.cmid == ($cmid | tonumber)) | .id
+    ' 2>/dev/null)
+
+    if [[ -n "$result" ]]; then
+      echo "$result"
+      return 0
+    fi
+  done
+
+  echo "Error: No assignment found with cmid=$cmid" >&2
+  return 1
+}
+
+# Show grades for a course
+cmd_grades() {
+  local course_input="${1:?Error: course abbreviation or ID required (e.g., MPPI, ProgPar)}"
+
+  local course_id
+  course_id=$(resolve_course_id "$course_input") || return 1
+
+  local userid
+  userid=$(get_userid) || return 1
+
+  local data
+  data=$(api_call "gradereport_user_get_grade_items" "courseid=${course_id}" "userid=${userid}") || return 1
+
+  echo "SCELE Grades: ${course_input} (ID: ${course_id})"
+  echo "$(printf '=%.0s' $(seq 1 50))"
+  echo ""
+
+  local count
+  count=$(echo "$data" | jq '.usergrades[0].gradeitems | length // 0')
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No grade items found."
+    return 0
+  fi
+
+  # Print header
+  printf "  %-45s %8s %8s\n" "Item" "Grade" "Range"
+  printf "  %-45s %8s %8s\n" "----" "-----" "-----"
+
+  echo "$data" | jq -r '.usergrades[0].gradeitems[] | [
+    .itemname,
+    (.gradeformatted // "-" | gsub("&ndash;"; "-")),
+    (.rangeformatted // "-" | gsub("&ndash;"; "-")),
+    (.percentageformatted // "-"),
+    (.feedback // "")
+  ] | @tsv' | while IFS=$'\t' read -r itemname grade range pct feedback; do
+    itemname=$(echo "$itemname" | html_decode)
+    # Truncate long names
+    if [[ ${#itemname} -gt 45 ]]; then
+      itemname="${itemname:0:42}..."
+    fi
+    printf "  %-45s %8s %8s" "$itemname" "$grade" "$range"
+    if [[ "$pct" != "-" && "$pct" != "null" ]]; then
+      printf " (%s)" "$pct"
+    fi
+    echo ""
+    if [[ -n "$feedback" && "$feedback" != "null" ]]; then
+      echo "    Feedback: $(echo "$feedback" | sed 's/<[^>]*>//g' | html_decode | head -c 100)"
+    fi
+  done
+}
+
+# List all assignments for a course with submission status
+cmd_submissions() {
+  local course_input="${1:?Error: course abbreviation or ID required (e.g., MPPI, ProgPar)}"
+
+  local course_id
+  course_id=$(resolve_course_id "$course_input") || return 1
+
+  local userid
+  userid=$(get_userid) || return 1
+
+  local data
+  data=$(api_call "mod_assign_get_assignments" "courseids%5B0%5D=${course_id}") || return 1
+
+  local assign_count
+  assign_count=$(echo "$data" | jq '.courses[0].assignments | length // 0')
+
+  if [[ "$assign_count" -eq 0 ]]; then
+    echo "No assignments found for ${course_input}."
+    return 0
+  fi
+
+  echo "SCELE Assignments: ${course_input} (ID: ${course_id})"
+  echo "$(printf '=%.0s' $(seq 1 50))"
+  echo ""
+
+  # Filter to user's class or class-agnostic
+  echo "$data" | jq -r '.courses[0].assignments[] | [
+    (.id | tostring),
+    .name,
+    (.duedate | tostring),
+    (.cmid | tostring)
+  ] | @tsv' | while IFS=$'\t' read -r assignid name duedate cmid; do
+    name=$(echo "$name" | html_decode)
+
+    # Filter by class
+    if echo "$name" | grep -q "Kelas " && ! echo "$name" | grep -q "Kelas ${USER_CLASS}"; then
+      continue
+    fi
+
+    # Get submission status for this assignment
+    local sub_data sub_status
+    sub_data=$(api_call "mod_assign_get_submission_status" "assignid=${assignid}" "userid=${userid}" 2>/dev/null)
+    sub_status=$(echo "$sub_data" | jq -r '.lastattempt.submission.status // "no submission"' 2>/dev/null)
+
+    # Format due date
+    local due_str="No due date"
+    if [[ "$duedate" != "0" ]]; then
+      due_str=$(format_datetime "$duedate")
+    fi
+
+    # Status emoji
+    local status_icon
+    case "$sub_status" in
+      submitted) status_icon="[OK]" ;;
+      draft)     status_icon="[DRAFT]" ;;
+      *)         status_icon="[PENDING]" ;;
+    esac
+
+    # Check if overdue
+    local now_ts
+    now_ts=$(date +%s)
+    if [[ "$duedate" != "0" && "$now_ts" -gt "$duedate" && "$sub_status" != "submitted" ]]; then
+      status_icon="[OVERDUE]"
+    fi
+
+    echo "  ${status_icon} ${name}"
+    echo "       Due: ${due_str}  |  Status: ${sub_status}"
+    echo "       -> https://scele.cs.ui.ac.id/mod/assign/view.php?id=${cmid}"
+    echo ""
+  done
+}
+
+# Show recent course announcements / forum posts
+cmd_announcements() {
+  local course_input="${1:?Error: course abbreviation or ID required (e.g., MPPI, ProgPar)}"
+
+  local course_id
+  course_id=$(resolve_course_id "$course_input") || return 1
+
+  # First, get forums in the course
+  local forums
+  forums=$(api_call "mod_forum_get_forums_by_courses" "courseids%5B0%5D=${course_id}") || return 1
+
+  local forum_count
+  forum_count=$(echo "$forums" | jq 'length // 0')
+
+  if [[ "$forum_count" -eq 0 ]]; then
+    echo "No forums found in ${course_input}."
+    return 0
+  fi
+
+  echo "SCELE Announcements: ${course_input} (ID: ${course_id})"
+  echo "$(printf '=%.0s' $(seq 1 50))"
+  echo ""
+
+  echo "$forums" | jq -r '.[] | [(.id | tostring), .name, .type] | @tsv' | while IFS=$'\t' read -r forumid forumname forumtype; do
+    forumname=$(echo "$forumname" | html_decode)
+
+    # Get discussions for this forum (sorted by recent)
+    local discussions
+    discussions=$(api_call "mod_forum_get_forum_discussions" "forumid=${forumid}" "sortorder=4" "perpage=5") || continue
+
+    local disc_count
+    disc_count=$(echo "$discussions" | jq '.discussions | length // 0')
+
+    if [[ "$disc_count" -eq 0 ]]; then
+      continue
+    fi
+
+    echo "## ${forumname}"
+    echo ""
+
+    echo "$discussions" | jq -r '.discussions[] | [
+      .name,
+      (.timemodified | tostring),
+      .userfullname,
+      .message
+    ] | @tsv' | while IFS=$'\t' read -r disc_name disc_time disc_author disc_message; do
+      disc_name=$(echo "$disc_name" | html_decode)
+      disc_author=$(echo "$disc_author" | html_decode)
+      local dt
+      dt=$(format_datetime "$disc_time")
+
+      echo "  [${dt}] ${disc_name}"
+      echo "  By: ${disc_author}"
+      # Show first 200 chars of message, strip HTML
+      local preview
+      preview=$(echo "$disc_message" | sed 's/<[^>]*>//g' | html_decode | tr '\n' ' ' | head -c 200)
+      if [[ -n "$preview" ]]; then
+        echo "  ${preview}..."
+      fi
+      echo ""
+    done
+  done
+}
+
+# =====================================================================
+# Added commands (May 2026 upgrade — learnings from KP submission flow)
+# =====================================================================
+
+# Show user profile constants so Claude / scripts can discover identity context.
+cmd_me() {
+  if [[ -z "$USER_NPM" && -z "$USER_NAME" ]]; then
+    cat <<EOF
+No user profile loaded.
+
+Run \`scele init\` to create ~/.config/scele/profile.sh, then edit it with
+your NPM, kelas, dosen, etc. Some commands (\`me\`, \`bind\`-default-naming,
+deadline class filtering) need this to be useful.
+EOF
+    return 0
+  fi
+  cat <<EOF
+User Profile
+============
+Name:        ${USER_NAME}
+NPM:         ${USER_NPM}
+Email (UI):  ${USER_EMAIL_UI}
+Email (GM):  ${USER_EMAIL_GMAIL}
+Filename:    ${USER_NAME_FILENAME}   # used in SCELE filename templates
+Class:       ${USER_CLASS}            # general kelas (for deadlines filter)
+
+KP-Specific
+-----------
+Kelas KP:    ${USER_KP_CLASS}
+Batch:       ${USER_KP_BATCH}         # for Final_BatchN_NPM_Nama.pdf
+Dosen code:  ${USER_KP_DOSEN_CODE}
+Dosen name:  ${USER_KP_DOSEN_NAME}
+Dosen email: ${USER_KP_DOSEN_EMAIL}
+Instansi:    ${USER_KP_INSTANSI}
+Penyelia:    ${USER_KP_PENYELIA}
+EOF
+}
+
+# Create the user profile file from the bundled template.
+# Why: every Fasilkom student installing this skill has a different NPM, kelas,
+# dosen, and enrolled courses. This bootstraps the per-user config.
+cmd_init() {
+  local cfg_dir="$HOME/.config/scele"
+  local cfg="$cfg_dir/profile.sh"
+  local template
+  # Resolve the skill root from this script's location: <skill>/bin/scele
+  template="$(cd "$(dirname "$0")/.." && pwd)/templates/profile.sh.example"
+
+  mkdir -p "$cfg_dir"
+  if [[ -f "$cfg" ]]; then
+    echo "Profile already exists at: $cfg"
+    echo "Edit it directly or remove it first to re-init."
+    return 0
+  fi
+  if [[ ! -f "$template" ]]; then
+    echo "Error: template not found at $template" >&2
+    echo "Are you running the skill from a non-standard location?" >&2
+    return 1
+  fi
+  cp "$template" "$cfg"
+  chmod 600 "$cfg"
+  echo "Created $cfg"
+  echo
+  echo "Next steps:"
+  echo "  1. Edit $cfg with your NPM, kelas, dosen, and enrolled COURSE_IDS."
+  echo "  2. Ensure ~/.secrets has SCELE_USERNAME and SCELE_PASSWORD."
+  echo "  3. Run: scele me   # to verify the profile loaded"
+}
+
+# Read full assignment intro/description + submission constraints by cmid.
+# Why: the user-facing "intro" text on an assign module often contains naming
+# conventions, file-type rules, and special instructions that aren't visible
+# in the bare title returned by `scele content` or `scele submissions`.
+cmd_assignment() {
+  local cmid="${1:?Error: course module ID required (from SCELE URL ?id=)}"
+
+  # Find which course this cmid belongs to by iterating known courses
+  for course_id in "${COURSE_IDS[@]}"; do
+    local data
+    data=$(api_call "mod_assign_get_assignments" "courseids%5B0%5D=${course_id}" 2>/dev/null) || continue
+
+    local match
+    match=$(echo "$data" | jq -r --arg cmid "$cmid" '
+      .courses[0].assignments[] | select(.cmid == ($cmid | tonumber))
+    ' 2>/dev/null)
+
+    if [[ -n "$match" && "$match" != "null" ]]; then
+      local name intro duedate cutoffdate id
+      name=$(echo "$match"     | jq -r '.name')
+      id=$(echo "$match"       | jq -r '.id')
+      duedate=$(echo "$match"  | jq -r '.duedate')
+      cutoffdate=$(echo "$match" | jq -r '.cutoffdate')
+      intro=$(echo "$match"    | jq -r '.intro')
+
+      echo "Assignment: ${name}"
+      echo "  cmid:     ${cmid}"
+      echo "  assignid: ${id}"
+      [[ "$duedate" != "0" && "$duedate" != "null" ]] && echo "  Due:      $(format_datetime "$duedate")"
+      [[ "$cutoffdate" != "0" && "$cutoffdate" != "null" ]] && echo "  Cutoff:   $(format_datetime "$cutoffdate")"
+      echo ""
+      echo "--- Description ---"
+      # Strip HTML, decode entities, normalize whitespace
+      echo "$intro" \
+        | sed -e 's|</p>|\n|g' -e 's|<br/\?>|\n|g' -e 's/<[^>]*>//g' \
+        | html_decode \
+        | awk 'NF { print; blank=0; next } !blank { print; blank=1 }'
+      echo ""
+
+      # Show submission constraints from configs (file plugin)
+      echo "--- Submission constraints ---"
+      echo "$match" | jq -r '
+        .configs[] |
+        select(.plugin == "file" and (.name == "filetypeslist" or .name == "maxfilesubmissions" or .name == "maxsubmissionsizebytes")) |
+        "  \(.name): \(.value)"
+      '
+      echo ""
+      echo "URL: ${SCELE_URL}/mod/assign/view.php?id=${cmid}"
+      return 0
+    fi
+  done
+
+  echo "Error: No assignment found with cmid=${cmid} in known courses (${!COURSE_IDS[*]})." >&2
+  return 1
+}
+
+# Read the body of a page or label module (or any module's description) by cmid.
+# Why: `scele content` lists module titles only. Page/label text bodies (e.g.,
+# KP "Linimasa", "Pengumpulan Deliverables", inline rich-text labels) require
+# fetching the section descriptions and stripping HTML.
+cmd_page() {
+  local cmid="${1:?Error: course module ID required (from SCELE URL ?id=)}"
+
+  # Try direct module fetch first (cheaper)
+  local mod_data
+  mod_data=$(api_call "core_course_get_course_module" "cmid=${cmid}" 2>/dev/null) || true
+
+  local course_id=""
+  if [[ -n "$mod_data" ]]; then
+    course_id=$(echo "$mod_data" | jq -r '.cm.course // empty' 2>/dev/null)
+  fi
+
+  # Fallback: iterate known courses
+  local courses_to_try
+  if [[ -n "$course_id" ]]; then
+    courses_to_try=("$course_id")
+  else
+    courses_to_try=("${COURSE_IDS[@]}")
+  fi
+
+  for cid in "${courses_to_try[@]}"; do
+    local data
+    data=$(api_call "core_course_get_contents" "courseid=${cid}" 2>/dev/null) || continue
+
+    local match
+    match=$(echo "$data" | jq -r --arg cmid "$cmid" '
+      [.[] | .modules[]? | select(.id == ($cmid | tonumber))] | first
+    ' 2>/dev/null)
+
+    if [[ -n "$match" && "$match" != "null" ]]; then
+      local name modname description
+      name=$(echo "$match"        | jq -r '.name')
+      modname=$(echo "$match"     | jq -r '.modname')
+      description=$(echo "$match" | jq -r '.description // empty')
+
+      echo "${name}  [${modname}]"
+      echo "URL: ${SCELE_URL}/mod/${modname}/view.php?id=${cmid}"
+      echo ""
+
+      if [[ -z "$description" ]]; then
+        # For mod_page, the body lives in `contents[]` files (index.html)
+        echo "$match" | jq -r '.contents[]? | select(.filename == "index.html") | .fileurl' \
+          | while read -r url; do
+              local token
+              token=$(get_token)
+              curl -sL "${url}&token=${token}" \
+                | sed -e 's|</p>|\n|g' -e 's|<br/\?>|\n|g' -e 's/<[^>]*>//g' \
+                | html_decode \
+                | awk 'NF { print; blank=0; next } !blank { print; blank=1 }'
+            done
+      else
+        echo "$description" \
+          | sed -e 's|</p>|\n|g' -e 's|<br/\?>|\n|g' -e 's/<[^>]*>//g' \
+          | html_decode \
+          | awk 'NF { print; blank=0; next } !blank { print; blank=1 }'
+      fi
+      return 0
+    fi
+  done
+
+  echo "Error: No module found with cmid=${cmid}." >&2
+  return 1
+}
+
+# List all posts in a forum discussion thread.
+# Why: `scele announcements` only shows discussion titles + first-post snippet.
+# After bulk-posting forum replies (e.g., 13 weekly KP logs), verification
+# requires enumerating every post in the thread.
+cmd_posts() {
+  local discussion_id="${1:?Error: discussion ID required (numeric, from /mod/forum/discuss.php?d=)}"
+
+  local data
+  data=$(api_call "mod_forum_get_discussion_posts" "discussionid=${discussion_id}") || return 1
+
+  local count
+  count=$(echo "$data" | jq '.posts | length // 0')
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No posts found in discussion ${discussion_id}." >&2
+    return 1
+  fi
+
+  echo "Forum Discussion ${discussion_id} (${count} posts)"
+  echo "URL: ${SCELE_URL}/mod/forum/discuss.php?d=${discussion_id}"
+  echo ""
+
+  echo "$data" | jq -r '.posts | sort_by(.timecreated) | .[] | [
+    (.timecreated | tostring),
+    (.author.fullname // "?"),
+    (.subject // "(no subject)"),
+    (.message // "")
+  ] | @tsv' | while IFS=$'\t' read -r ts author subject message; do
+    local dt
+    dt=$(format_datetime "$ts")
+    subject=$(echo "$subject" | html_decode)
+    author=$(echo "$author"   | html_decode)
+    echo "  [${dt}] ${subject}"
+    echo "    By: ${author}"
+    # Show preview (first 200 chars of stripped body)
+    local preview
+    preview=$(echo "$message" | sed 's/<[^>]*>//g' | html_decode | tr '\n' ' ' | head -c 200)
+    if [[ -n "$preview" ]]; then
+      echo "    ${preview}..."
+    fi
+    echo ""
+  done
+}
+
+# Concatenate PDFs into one — used to build a single laporan + lampiran PDF
+# matching the SCELE "1 PDF max" submission constraint.
+# Why: We learned (May 22 2026) that SCELE's Laporan Akhir slot accepts only
+# 1 file, so KAKP + Log PDFs must be physically appended after the body.
+cmd_bind() {
+  local output="${1:?Usage: scele bind <output.pdf> <input1.pdf> [<input2.pdf> ...]}"
+  shift
+
+  if [[ $# -lt 1 ]]; then
+    echo "Error: at least one input PDF required after output path." >&2
+    return 1
+  fi
+
+  if ! command -v pdfunite >/dev/null 2>&1; then
+    echo "Error: pdfunite not found. Install via 'brew install poppler'." >&2
+    return 1
+  fi
+
+  # Validate all inputs exist
+  local missing=0
+  for f in "$@"; do
+    if [[ ! -f "$f" ]]; then
+      echo "Error: input not found: $f" >&2
+      missing=1
+    fi
+  done
+  (( missing )) && return 1
+
+  pdfunite "$@" "$output" || {
+    echo "Error: pdfunite failed." >&2
+    return 1
+  }
+
+  # Report
+  local pages size
+  pages=$(pdfinfo "$output" 2>/dev/null | awk '/^Pages:/ {print $2}')
+  size=$(du -h "$output" 2>/dev/null | cut -f1)
+  echo "Wrote ${output} (${pages} pages, ${size})"
+}
+
+# Fetch a Google Sheet as CSV. Optionally filter rows by a value.
+# Why: SCELE references several spreadsheets (e.g., Pembagian Dosen Dan Status
+# Dokumen KP) that hold per-student status data. Looking up the user's row by
+# NPM is a frequent operation.
+cmd_sheet() {
+  local alias_or_id="${1:?Usage: scele sheet <alias_or_id> [<lookup_value>]}"
+  local lookup="${2:-}"
+
+  local sheet_id="$alias_or_id"
+  if [[ -n "${KNOWN_SHEETS[$alias_or_id]:-}" ]]; then
+    sheet_id="${KNOWN_SHEETS[$alias_or_id]}"
+  fi
+
+  local csv
+  csv=$(curl -sL "https://docs.google.com/spreadsheets/d/${sheet_id}/export?format=csv") || {
+    echo "Error: failed to fetch sheet ${sheet_id}." >&2
+    return 1
+  }
+
+  if [[ -z "$lookup" ]]; then
+    echo "$csv"
+    return 0
+  fi
+
+  # Print header + matching rows
+  echo "$csv" | head -3
+  echo "..."
+  echo "$csv" | grep -F "$lookup" || {
+    echo "No rows matching '${lookup}' found." >&2
+    return 1
+  }
+}
+
+# Main dispatch
+cmd="${1:-events}"
+case "$cmd" in
+  events)
+    cmd_events "all"
+    ;;
+  deadlines)
+    cmd_events "assign"
+    ;;
+  courses)
+    cmd_courses
+    ;;
+  content)
+    cmd_content "${2:-}" "${3:-}"
+    ;;
+  download)
+    cmd_download "${2:-}" "${3:-}"
+    ;;
+  submit)
+    cmd_submit "${2:-}" "${3:-}"
+    ;;
+  status)
+    cmd_status "${2:-}"
+    ;;
+  assignid)
+    cmd_assignid "${2:-}"
+    ;;
+  grades)
+    cmd_grades "${2:-}"
+    ;;
+  submissions)
+    cmd_submissions "${2:-}"
+    ;;
+  announcements|news)
+    cmd_announcements "${2:-}"
+    ;;
+  assignment|assign)
+    cmd_assignment "${2:-}"
+    ;;
+  posts|thread)
+    cmd_posts "${2:-}"
+    ;;
+  page|label|module)
+    cmd_page "${2:-}"
+    ;;
+  bind)
+    shift
+    cmd_bind "$@"
+    ;;
+  sheet)
+    cmd_sheet "${2:-}" "${3:-}"
+    ;;
+  me|whoami|profile)
+    cmd_me
+    ;;
+  init)
+    cmd_init
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
