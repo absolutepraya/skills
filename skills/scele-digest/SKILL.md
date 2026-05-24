@@ -156,7 +156,20 @@ For each KEPT message with `has_media == True`:
 4. If voice/video: skip — note as "voice note from <sender>" so the user knows to listen manually.
 5. If download fails: record in run health and skip — non-fatal.
 
-After media is read, synthesize **one** combined `telegram_ai_summary` string covering all courses with activity. Aim for 4–10 lines total. Tag each section with the course abbrev in bold (`<strong>ProgPar</strong>: ...`). Per course with kept messages, the summary should answer:
+After media is read, synthesize **one** combined `telegram_ai_summary` string covering all courses with activity. Aim for 4–10 lines total.
+
+**Exactly one section per course.** Even if there are several distinct topics from a course's chat, fold them into a single course block — don't emit `<strong>ABBREV</strong>:` repeatedly. Format:
+
+```
+<strong>ABBREV</strong>
+- topic 1
+- topic 2
+- topic 3
+```
+
+Bold course header on its own line; sub-points as dash bullets below. Use `<br>` for line breaks if needed. If a course has only one point, inline it as `<strong>ABBREV</strong>: <point>`. Either way, one course = one section.
+
+Per course with kept messages, the section should cover:
 
 - What is the group actually doing right now?
 - What does the user need to do?

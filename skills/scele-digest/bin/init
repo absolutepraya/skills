@@ -1,13 +1,48 @@
 #!/usr/bin/env bash
 # scele-digest first-time setup.
 #
-# Creates ~/.config/scele-digest/ and seeds it with example config + env
-# files. Idempotent — won't overwrite existing files.
+# Idempotent. Does three things:
+#   1. Seeds ~/.config/scele-digest/{config.yaml,telegram.env} from templates
+#      (won't overwrite existing files).
+#   2. (default) Creates a .venv inside the skill dir and pip-installs the
+#      Python deps that bin/send-digest and bin/tg-window need.
+#   3. (default) Patches the shebangs of bin/send-digest and bin/tg-window
+#      to point at that .venv's python, so the agent can invoke them
+#      directly without needing pyyaml/requests/telethon on system python.
+#
+# Flags:
+#   --no-venv     skip venv creation and shebang patching (you'll handle deps yourself)
+#   --skip-deps   create venv but skip pip install (e.g. you already installed deps)
 
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="${HOME}/.config/scele-digest"
+VENV_DIR="${SKILL_DIR}/.venv"
+
+DO_VENV=1
+DO_DEPS=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-venv)   DO_VENV=0 ;;
+        --skip-deps) DO_DEPS=0 ;;
+        -h|--help)
+            sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "unknown flag: $arg" >&2
+            exit 2
+            ;;
+    esac
+done
+
+echo "scele-digest init"
+echo "  skill dir:  ${SKILL_DIR}"
+echo "  config dir: ${CONFIG_DIR}"
+echo ""
+
+# --- 1. Seed user config ---------------------------------------------------
 mkdir -p "${CONFIG_DIR}"
 
 seed() {
@@ -16,7 +51,7 @@ seed() {
     if [[ -e "${dst}" ]]; then
         echo "  exists: ${dst}"
     elif [[ ! -e "${src}" ]]; then
-        echo "  MISSING TEMPLATE: ${src}"
+        echo "  MISSING TEMPLATE: ${src}" >&2
         return 1
     else
         cp "${src}" "${dst}"
@@ -24,22 +59,68 @@ seed() {
     fi
 }
 
-echo "scele-digest init"
-echo "  skill dir:  ${SKILL_DIR}"
-echo "  config dir: ${CONFIG_DIR}"
-echo ""
-
 seed "config.yaml.example"   "config.yaml"
 seed "telegram.env.example"  "telegram.env"
-
 chmod 600 "${CONFIG_DIR}/telegram.env" 2>/dev/null || true
+echo ""
+
+# --- 2. Venv + deps --------------------------------------------------------
+if [[ "${DO_VENV}" == 1 ]]; then
+    if [[ ! -d "${VENV_DIR}" ]]; then
+        echo "  creating venv: ${VENV_DIR}"
+        python3 -m venv "${VENV_DIR}"
+    else
+        echo "  venv exists: ${VENV_DIR}"
+    fi
+
+    if [[ "${DO_DEPS}" == 1 ]]; then
+        echo "  installing deps (pyyaml requests telethon python-dotenv)..."
+        "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+        "${VENV_DIR}/bin/pip" install --quiet pyyaml requests telethon python-dotenv
+        echo "  deps installed."
+    else
+        echo "  --skip-deps: leaving venv untouched"
+    fi
+
+    # --- 3. Patch shebangs to point at this venv ---------------------------
+    patch_shebang() {
+        local script="${SKILL_DIR}/bin/$1"
+        local want="#!${VENV_DIR}/bin/python"
+        if [[ ! -f "${script}" ]]; then
+            echo "  warn: ${script} not found, skipping shebang patch" >&2
+            return 0
+        fi
+        local current
+        current="$(head -1 "${script}")"
+        if [[ "${current}" == "${want}" ]]; then
+            echo "  shebang ok: ${script}"
+        else
+            # Rewrite line 1 in place. Use awk for portability (BSD/GNU sed differ).
+            local tmp
+            tmp="$(mktemp)"
+            { echo "${want}"; tail -n +2 "${script}"; } > "${tmp}"
+            chmod +x "${tmp}"
+            mv "${tmp}" "${script}"
+            echo "  patched shebang: ${script}"
+        fi
+    }
+
+    patch_shebang "send-digest"
+    patch_shebang "tg-window"
+else
+    echo "  --no-venv: skipping venv + shebang patching"
+fi
 
 echo ""
 echo "next steps:"
 echo "  1. edit ${CONFIG_DIR}/config.yaml — fill in semester, courses, discord."
-echo "  2. (optional) edit ${CONFIG_DIR}/telegram.env if you want telegram integration."
-echo "  3. install python deps:"
-echo "       python3 -m venv ${SKILL_DIR}/.venv"
-echo "       ${SKILL_DIR}/.venv/bin/pip install pyyaml requests telethon python-dotenv"
-echo "  4. point bin/send-digest + bin/tg-window to that venv (edit the shebang or symlink)."
-echo "  5. test: see README.md for run/dry-run examples."
+echo "  2. if you want telegram integration, set telegram.enabled: true in config.yaml"
+echo "     and fill in ${CONFIG_DIR}/telegram.env (see comments inside for how)."
+echo "  3. smoke-test:"
+echo "       echo '{\"run_date_display\":\"smoke test\",\"upcoming_deadlines\":[],\"health\":{}}' \\"
+echo "         | ${SKILL_DIR}/bin/send-digest --dry-run"
+echo "     should print 'OK: wrote /tmp/scele-digest-preview.json' and the preview file"
+echo "     will contain a small Discord payload with one (empty) Upcoming embed."
+echo "  4. once dry-run looks right, invoke the skill from your agent:"
+echo "       'run scele-digest'  (live)"
+echo "       'run scele-digest --dry-run'  (no post, no state mutation)"
