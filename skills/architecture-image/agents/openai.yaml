@@ -1,0 +1,4 @@
+interface:
+  display_name: "Architecture Image"
+  short_description: "Create crisp SVG architecture diagrams"
+  default_prompt: "Use $architecture-image to create a clean SVG architecture diagram and render it to PNG."

@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Render scele-digest as Discord embeds from JSON on stdin, and POST to a
+Discord channel — via webhook URL OR bot token, as configured.
+
+Input contract: JSON payload shape documented in SKILL.md step 8. Output is
+one Discord message containing several embeds plus a header/health line as
+plain content.
+
+Config: reads ~/.config/scele-digest/config.yaml for the Discord destination.
+"""
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import requests
+import yaml
+
+
+CONFIG_PATH = Path.home() / ".config" / "scele-digest" / "config.yaml"
+PREVIEW_PATH = Path("/tmp/scele-digest-preview.json")
+API_BASE = "https://discord.com/api/v10"
+
+# Embed side-bar gradient: top → bottom, applied in render order. Discord
+# embeds can't render a true gradient — each embed gets a single color, so
+# this produces N stacked stripes that read as a gradient.
+GRADIENT = [0xFF5F00, 0xFF8C00, 0xFFC300, 0xFFD400]
+
+# Discord limits
+MAX_DESCRIPTION = 4096
+MAX_EMBEDS_PER_MSG = 10
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        raise SystemExit(
+            f"ERR: config not found at {CONFIG_PATH}. Run `bin/init` first."
+        )
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def nice_time(iso_str):
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return str(iso_str)
+    return dt.strftime("%H:%M")
+
+
+def nice_date(iso_str):
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return str(iso_str)
+    return dt.strftime("%a %d %b")
+
+
+def truncate(s, limit):
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1].rstrip() + "…"
+
+
+def html_to_md(s):
+    """Convert the simple HTML the AI summaries emit into Discord markdown."""
+    if not s:
+        return ""
+    s = str(s)
+    repls = [
+        ("<br/>", "\n"), ("<br />", "\n"), ("<br>", "\n"),
+        ("<strong>", "**"), ("</strong>", "**"),
+        ("<b>", "**"), ("</b>", "**"),
+        ("<em>", "*"), ("</em>", "*"),
+        ("<i>", "*"), ("</i>", "*"),
+    ]
+    for old, new in repls:
+        s = s.replace(old, new)
+    return s
+
+
+def fmt_deadline_line(d):
+    abbrev = d.get("abbrev", "?")
+    title = d.get("title", "")
+    url = d.get("scele_url", "")
+    due = d.get("due_iso", "")
+    urgency = d.get("urgency", "")
+    if urgency == "today":
+        when = f"today {nice_time(due)}"
+    elif urgency == "tomorrow":
+        when = f"tomorrow {nice_time(due)}"
+    else:
+        when = nice_date(due)
+    link = f"[{title}]({url})" if url else title
+    return f"• `{abbrev}` {link}\n  {when}"
+
+
+def build_content(payload):
+    """Plain message text above the embeds: header line + health subtext."""
+    health = payload.get("health") or {}
+    new_count = len(payload.get("new_items", {}).get("deadlines", []))
+    added_count = len(payload.get("todos_added", []))
+    parts = []
+    if new_count:
+        parts.append(f"{new_count} new deadline{'s' if new_count != 1 else ''}")
+    if added_count:
+        parts.append(f"{added_count} added to Todoist")
+    if not parts:
+        parts.append("no new items")
+    header = f"**SCELE Digest — {payload.get('run_date_display', 'today')}** · {' · '.join(parts)}"
+    health_parts = []
+    for k in ("scele", "telegram", "todoist"):
+        v = health.get(k)
+        health_parts.append(f"{k} {'ok' if v is True else ('fail' if v is False else '—')}")
+    media = health.get("media_read")
+    media_mark = "ok" if media is True else ("fail" if media is False else "n/a")
+    health_parts.append(f"media_read {media_mark}")
+    health_line = "-# " + " · ".join(health_parts)
+    return f"{header}\n{health_line}"
+
+
+def build_deadlines_embed(payload):
+    upcoming = payload.get("upcoming_deadlines") or []
+    if not upcoming:
+        return {
+            "title": "Upcoming (14 days)",
+            "description": "_clear horizon — nothing due in the next 14 days._",
+        }
+    lines = [fmt_deadline_line(d) for d in upcoming]
+    return {
+        "title": f"Upcoming ({len(upcoming)})",
+        "description": truncate("\n\n".join(lines), MAX_DESCRIPTION),
+    }
+
+
+def build_added_embed(payload):
+    added = payload.get("todos_added") or []
+    if not added:
+        return None
+    lines = []
+    for t in added:
+        title = t.get("title", "")
+        due = t.get("due_iso", "")
+        url = t.get("scele_url", "")
+        link = f"[{title}]({url})" if url else title
+        when = nice_date(due) + (f" {nice_time(due)}" if "T" in str(due) else "")
+        lines.append(f"• {link}\n  {when}")
+    return {
+        "title": f"Added to Todoist ({len(added)})",
+        "description": truncate("\n\n".join(lines), MAX_DESCRIPTION),
+    }
+
+
+def build_announcements_embed(payload):
+    summary = payload.get("announcements_ai_summary")
+    new_a = payload.get("new_items", {}).get("announcements", [])
+    all_new = payload.get("announcements_all_new") or new_a
+    if not summary and not all_new:
+        return None
+    body = ""
+    if summary:
+        body = html_to_md(summary).strip()
+    if all_new:
+        bullets = []
+        for a in all_new[:6]:
+            ab = a.get("abbrev", "?")
+            ttl = a.get("title", "")
+            url = a.get("url", "")
+            link = f"[{ttl}]({url})" if url else ttl
+            bullets.append(f"`{ab}` {link}")
+        more = len(all_new) - 6
+        if more > 0:
+            bullets.append(f"_…and {more} more_")
+        if body:
+            body = body + "\n\n" + "\n".join(bullets)
+        else:
+            body = "\n".join(bullets)
+    return {
+        "title": "Course announcements",
+        "description": truncate(body, MAX_DESCRIPTION),
+    }
+
+
+def build_telegram_embed(payload):
+    # New keys take precedence; old keys still accepted for one window.
+    summary = payload.get("telegram_ai_summary") or payload.get("progpar_ai_summary")
+    msgs = payload.get("telegram_messages")
+    if msgs is None:
+        msgs = payload.get("telegram_progpar") or []
+    msgs = msgs or []
+    if not summary and not msgs:
+        return None
+    courses = []
+    for m in msgs:
+        c = m.get("course")
+        if c and c not in courses:
+            courses.append(c)
+    if courses:
+        title = f"Telegram — {', '.join(courses)} ({len(msgs)} msg)"
+    else:
+        title = f"Telegram ({len(msgs)} msg)"
+    body = html_to_md(summary).strip() if summary else "_no summary available._"
+    return {
+        "title": title,
+        "description": truncate(body, MAX_DESCRIPTION),
+    }
+
+
+def build_all_courses_embed(payload):
+    todos = payload.get("todos_all_courses") or []
+    if not todos:
+        return None
+    lines = []
+    for t in todos[:20]:
+        ttl = t.get("title", "")
+        url = t.get("todoist_url", "")
+        count = t.get("count", 1)
+        if count and count >= 3:
+            earliest = t.get("earliest_due_iso", "")
+            latest = t.get("latest_due_iso", "")
+            range_str = f"{nice_date(earliest)} → {nice_date(latest)}" if earliest and latest else ""
+            link = f"[{ttl}]({url})" if url else ttl
+            lines.append(f"• {link} ×{count}{(' ' + range_str) if range_str else ''}")
+        else:
+            due = t.get("due_iso", "")
+            link = f"[{ttl}]({url})" if url else ttl
+            when = nice_date(due) if due else ""
+            lines.append(f"• {link}{(' ' + when) if when else ''}")
+    more = len(todos) - 20
+    if more > 0:
+        lines.append(f"_…and {more} more_")
+    return {
+        "title": f"All course tasks ({len(todos)})",
+        "description": truncate("\n".join(lines), MAX_DESCRIPTION),
+    }
+
+
+def build_message(payload):
+    candidates = [
+        build_deadlines_embed(payload),
+        build_added_embed(payload),
+        build_announcements_embed(payload),
+        build_telegram_embed(payload),
+        build_all_courses_embed(payload),
+    ]
+    embeds = [e for e in candidates if e is not None][:MAX_EMBEDS_PER_MSG]
+    for i, e in enumerate(embeds):
+        e["color"] = GRADIENT[i] if i < len(GRADIENT) else GRADIENT[-1]
+    return {
+        "content": build_content(payload),
+        "embeds": embeds,
+        "allowed_mentions": {"parse": []},
+    }
+
+
+def post_via_webhook(body, webhook_url):
+    # ?wait=true makes Discord return the created message object with its id
+    url = webhook_url + ("&" if "?" in webhook_url else "?") + "wait=true"
+    resp = requests.post(
+        url,
+        headers={"Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Discord webhook {resp.status_code}: {resp.text[:400]}")
+    return resp.json().get("id", "<no-id>")
+
+
+def post_via_bot(body, channel_id, token):
+    resp = requests.post(
+        f"{API_BASE}/channels/{channel_id}/messages",
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "scele-digest (https://github.com/absolutepraya/skills, 1.0)",
+        },
+        json=body,
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Discord {resp.status_code}: {resp.text[:400]}")
+    return resp.json().get("id", "<no-id>")
+
+
+def post_discord(body, cfg):
+    discord = cfg.get("discord") or {}
+    webhook = discord.get("webhook_url")
+    if webhook:
+        return post_via_webhook(body, webhook)
+    channel_id = discord.get("channel_id")
+    token_env = discord.get("bot_token_env") or "DISCORD_BOT_TOKEN"
+    token = os.environ.get(token_env)
+    if not channel_id:
+        raise RuntimeError("discord: neither webhook_url nor channel_id set in config.yaml")
+    if not token:
+        raise RuntimeError(f"discord: bot token env var {token_env!r} is empty")
+    return post_via_bot(body, channel_id, token)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Render and post scele-digest to Discord.")
+    ap.add_argument("--dry-run", action="store_true", help="Build the payload and write to /tmp/scele-digest-preview.json instead of posting.")
+    args = ap.parse_args()
+
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f"ERR: invalid JSON on stdin: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    cfg = load_config()
+
+    try:
+        body = build_message(payload)
+    except Exception as e:
+        print(f"ERR: render failed: {e}", file=sys.stderr)
+        sys.exit(3)
+
+    if args.dry_run:
+        PREVIEW_PATH.write_text(json.dumps(body, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"OK: wrote {PREVIEW_PATH}")
+        print(f"    embeds: {len(body['embeds'])}")
+        return
+
+    try:
+        msg_id = post_discord(body, cfg)
+    except Exception as e:
+        print(f"ERR: discord post failed: {e}", file=sys.stderr)
+        sys.exit(4)
+    print(f"OK: posted {msg_id}")
+
+
+if __name__ == "__main__":
+    main()

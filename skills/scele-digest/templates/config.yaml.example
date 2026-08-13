@@ -1,0 +1,16 @@
+# Discord delivery for scele-digest.
+# Active course data belongs in ~/.config/scele/course-profile.json.
+
+discord:
+  # Use one delivery mode.
+  webhook_url: null
+  channel_id: null
+  bot_token_env: DISCORD_BOT_TOKEN
+
+todoist:
+  enabled: false
+  project_id: null
+
+telegram:
+  enabled: false
+  env_file: ~/.config/scele-digest/telegram.env

@@ -1,0 +1,21 @@
+# Optional identity and class metadata for the scele CLI.
+# Course aliases and SCELE course IDs live in course-profile.json instead.
+
+USER_CLASS="D"
+USER_NPM=""
+USER_NAME=""
+USER_NAME_FILENAME=""
+USER_EMAIL_UI=""
+USER_EMAIL_GMAIL=""
+
+# Optional internship-specific metadata used by `scele me` and filename guidance.
+USER_KP_CLASS=""
+USER_KP_BATCH="1"
+USER_KP_DOSEN_CODE=""
+USER_KP_DOSEN_NAME=""
+USER_KP_DOSEN_EMAIL=""
+USER_KP_INSTANSI=""
+USER_KP_PENYELIA=""
+
+# Optional Google Sheet aliases. Requires Bash 4+.
+# KNOWN_SHEETS["sheet_alias"]="spreadsheet_id"

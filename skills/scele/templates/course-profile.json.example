@@ -1,0 +1,19 @@
+{
+  "term": {
+    "name": "Gasal 2026/2027",
+    "timezone": "Asia/Jakarta"
+  },
+  "courses": [
+    {
+      "alias": "COURSE",
+      "scele_course_id": 1234,
+      "scele_shortname": "COURSE-TERM",
+      "display_name": "Course Name",
+      "todoist_prefix": "COURSE",
+      "todoist_aliases": [],
+      "telegram_group": null,
+      "lab_team": null,
+      "lecturers": []
+    }
+  ]
+}

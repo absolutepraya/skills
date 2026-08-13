@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Match SCELE deadlines to existing Todoist tasks without side effects."""
+
+import json
+import re
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Any
+
+DUE_SUFFIX = re.compile(r",\s*due\b.*\Z", re.IGNORECASE)
+URL_BOUNDARY = r'(?=$|[\s)\]}>.,;:!?"\'])'
+
+
+class DedupError(ValueError):
+    pass
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise DedupError(message)
+
+
+def nonempty(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def load_aliases(path: Path) -> dict[str, list[dict[str, Any]]]:
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise DedupError(f"cannot load course profile: {error}") from error
+    require(isinstance(profile, dict) and isinstance(profile.get("courses"), list), "profile.courses must be an array")
+    aliases: dict[str, list[dict[str, Any]]] = {}
+    for index, course in enumerate(profile["courses"]):
+        require(isinstance(course, dict) and nonempty(course.get("todoist_prefix")), f"profile.courses[{index}].todoist_prefix is required")
+        prefix = course["todoist_prefix"]
+        require(prefix not in aliases, f"duplicate todoist_prefix: {prefix}")
+        values = course.get("todoist_aliases", [])
+        require(isinstance(values, list), f"profile.courses[{index}].todoist_aliases must be an array")
+        seen: set[int] = set()
+        parsed = []
+        for alias_index, alias in enumerate(values):
+            require(isinstance(alias, dict) and positive_int(alias.get("scele_cmid")) and nonempty(alias.get("task_title")), f"invalid Todoist alias at courses[{index}].todoist_aliases[{alias_index}]")
+            cmid = alias["scele_cmid"]
+            require(cmid not in seen, f"duplicate Todoist alias cmid: {cmid}")
+            seen.add(cmid)
+            parsed.append(alias)
+        aliases[prefix] = parsed
+    return aliases
+
+
+def normalize_title(value: str, prefix: str) -> str | None:
+    value = " ".join(DUE_SUFFIX.sub("", unicodedata.normalize("NFKC", value).casefold()).split())
+    prefix = " ".join(unicodedata.normalize("NFKC", prefix).casefold().split())
+    for separator in (" - ", " — "):
+        marker = prefix + separator
+        if value.startswith(marker):
+            return value[len(marker):]
+    return None
+
+
+def match(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    profile_value = payload.get("profile_path")
+    profile = Path(profile_value) if nonempty(profile_value) else Path(__file__).resolve().parent.parent / "course-profile.json"
+    aliases = load_aliases(profile)
+    deadlines = payload.get("deadlines")
+    tasks = payload.get("tasks")
+    require(isinstance(deadlines, list), "deadlines must be an array")
+    require(isinstance(tasks, list), "tasks must be an array")
+    parsed_tasks = []
+    for index, task in enumerate(tasks):
+        require(isinstance(task, dict) and isinstance(task.get("content"), str) and isinstance(task.get("description"), str), f"tasks[{index}] must contain string content and description")
+        parsed_tasks.append(task)
+    matched, unmatched, seen = [], [], set()
+    for index, deadline in enumerate(deadlines):
+        require(isinstance(deadline, dict), f"deadlines[{index}] must be an object")
+        cmid, title, source_url, prefix = (deadline.get(key) for key in ("cmid", "title", "scele_url", "todoist_prefix"))
+        require(positive_int(cmid) and nonempty(title) and nonempty(source_url) and nonempty(prefix), f"invalid deadline at deadlines[{index}]")
+        require(cmid not in seen, f"duplicate deadline cmid: {cmid}")
+        seen.add(cmid)
+        require(prefix in aliases, f"unconfigured todoist_prefix: {prefix}")
+        if any(re.search(re.escape(source_url) + URL_BOUNDARY, task["description"]) for task in parsed_tasks):
+            matched.append({"cmid": cmid, "reason": "source_url"})
+        elif any(task["content"] == alias["task_title"] for alias in aliases[prefix] if alias["scele_cmid"] == cmid for task in parsed_tasks):
+            matched.append({"cmid": cmid, "reason": "profile_alias"})
+        else:
+            generated = normalize_title(f"{prefix} — {title}", prefix)
+            if generated is not None and any(normalize_title(task["content"], prefix) == generated for task in parsed_tasks):
+                matched.append({"cmid": cmid, "reason": "normalized_title"})
+            else:
+                unmatched.append({"cmid": cmid})
+    return {"matched": matched, "unmatched": unmatched}
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+        require(isinstance(payload, dict), "input must be an object")
+        print(json.dumps(match(payload), ensure_ascii=False, separators=(",", ":")))
+        return 0
+    except (DedupError, json.JSONDecodeError) as error:
+        print(f"todoist-dedup: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
